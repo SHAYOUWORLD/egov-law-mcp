@@ -1,0 +1,42 @@
+{
+  "name": "@codeagentjp/egov-law-mcp",
+  "version": "0.1.0",
+  "description": "Local stdio MCP server for searching Japanese laws and retrieving article text from e-Gov Law Search. Includes related-law lookup (enforcement orders/regulations) inspired by Gennai Lawsy.",
+  "type": "module",
+  "bin": {
+    "egov-law-mcp": "./bin/egov-law-mcp.mjs"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "egov",
+    "japanese-law",
+    "law",
+    "legal-tech",
+    "lawsy",
+    "gennai",
+    "japan",
+    "rag"
+  ],
+  "author": "codeagent.jp",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SHAYOUWORLD/egov-law-mcp.git"
+  },
+  "homepage": "https://codeagent.jp/tools/egov-law-mcp",
+  "bugs": {
+    "url": "https://github.com/SHAYOUWORLD/egov-law-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
