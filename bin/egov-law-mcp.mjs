@@ -4,7 +4,10 @@ const SERVER_NAME = "egov-law-mcp";
 const SERVER_VERSION = "0.1.0";
 const PROTOCOL_VERSION = "2025-06-18";
 const EGOV_BASE_URL = "https://laws.e-gov.go.jp";
-const REQUEST_TIMEOUT_MS = Number.parseInt(process.env.EGOV_LAW_MCP_TIMEOUT_MS ?? "15000", 10);
+const REQUEST_TIMEOUT_MS = (() => {
+  const parsed = Number.parseInt(process.env.EGOV_LAW_MCP_TIMEOUT_MS ?? "15000", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 15000;
+})();
 
 let lawListCache = null;
 let lawListFetchedAt = null;
@@ -157,18 +160,22 @@ function categoryToApiValue(category) {
 }
 
 async function fetchText(path) {
-  if (!path.startsWith("/api/1/")) {
+  if (!path.startsWith("/api/1/") || path.includes("..") || path.includes("//")) {
     throw new Error("Internal error: refused non-e-Gov API path");
+  }
+
+  const url = new URL(path, EGOV_BASE_URL);
+  if (url.origin !== EGOV_BASE_URL) {
+    throw new Error("Internal error: resolved URL escaped e-Gov origin");
   }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  const url = `${EGOV_BASE_URL}${path}`;
 
   try {
     const response = await fetch(url, {
       method: "GET",
-      redirect: "follow",
+      redirect: "error",
       signal: controller.signal,
       headers: {
         "User-Agent": `${SERVER_NAME}/${SERVER_VERSION} (https://codeagent.jp/)`,
