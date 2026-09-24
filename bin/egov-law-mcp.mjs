@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const SERVER_NAME = "egov-law-mcp";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.1.1";
 const PROTOCOL_VERSION = "2025-06-18";
 const EGOV_BASE_URL = "https://laws.e-gov.go.jp";
 const REQUEST_TIMEOUT_MS = (() => {
