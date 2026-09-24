@@ -132,8 +132,11 @@ Suggested attribution:
 
 ## Related
 
-- Design notes: [源内のLawsy実装をMCP化するなら、どこを残してどこを捨てるべきか (codeagent.jp)](https://codeagent.jp/posts/gennai-lawsy-mcp-architecture/)
-- Background on Gennai OSS release: [政府AI「源内」のソースコードが商用利用可能な形で公開 (codeagent.jp)](https://codeagent.jp/posts/government-ai-gennai-oss-release-2026-04-24/)
+- Design notes: [源内OSSのLawsy実装をMCP化するなら、どこを残してどこを捨てるか (codeagent.jp)](https://codeagent.jp/posts/gennai-lawsy-mcp-architecture/)
+- Background on Gennai OSS release: [源内OSS公開の背景 (codeagent.jp)](https://codeagent.jp/posts/gennai-lawsy-mcp-architecture/#源内oss公開の背景)
+- Setup guides (Japanese): [Claude Code](https://codeagent.jp/posts/egov-law-mcp-claude-code-demo/) / [Codex CLI](https://codeagent.jp/posts/egov-law-mcp-codex-cli-setup/) / [Troubleshooting](https://codeagent.jp/posts/egov-law-mcp-troubleshooting/)
+- e-Gov Law API v2 guide (Japanese): [codeagent.jp/guides/egov-law-api/](https://codeagent.jp/guides/egov-law-api/)
+- Other Japanese public-data APIs and MCP servers: [codeagent.jp/guides/public-data-api/](https://codeagent.jp/guides/public-data-api/)
 - Reference implementation we learned from: [digital-go-jp/genai-ai-api/google-cloud/lawsy-custom-bq](https://github.com/digital-go-jp/genai-ai-api/tree/main/google-cloud/lawsy-custom-bq)
 
 ## License
