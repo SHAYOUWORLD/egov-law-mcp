@@ -1,27 +1,57 @@
 #!/usr/bin/env node
 
 const SERVER_NAME = "egov-law-mcp";
-const SERVER_VERSION = "0.1.1";
+const SERVER_VERSION = "0.2.0";
 const PROTOCOL_VERSION = "2025-06-18";
 const EGOV_BASE_URL = "https://laws.e-gov.go.jp";
+const EGOV_API_PREFIX = "/api/2";
+const EGOV_API_NAME = "法令API Version 2";
+const ATTRIBUTION = "出典: e-Gov法令検索（https://laws.e-gov.go.jp/）";
+const PROCESSING_NOTE = "法令API Version 2 の law_data で取得した法令XMLからタグを除き、平文にした。";
 const REQUEST_TIMEOUT_MS = (() => {
   const parsed = Number.parseInt(process.env.EGOV_LAW_MCP_TIMEOUT_MS ?? "15000", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 15000;
 })();
+// e-Gov requests are sent one at a time, each at least this long after the
+// previous one finished. EGOV_LAW_MCP_INTERVAL_MS can lengthen it, not shorten it.
+const MIN_REQUEST_INTERVAL_MS = 1000;
+const REQUEST_INTERVAL_MS = (() => {
+  const parsed = Number.parseInt(process.env.EGOV_LAW_MCP_INTERVAL_MS ?? "", 10);
+  return Number.isFinite(parsed) && parsed > MIN_REQUEST_INTERVAL_MS ? parsed : MIN_REQUEST_INTERVAL_MS;
+})();
+const CACHE_TTL_MS = 5 * 60 * 1000;
+const CACHE_MAX_ENTRIES = 20;
+const CACHE_MAX_BODY_CHARS = 2_000_000;
+// laws?law_title= is a partial match on the e-Gov side; up to this many hits are ranked locally.
+const SEARCH_SCAN_LIMIT = 500;
+const ALLOWED_API_PATH = /^\/api\/2\/(?:laws|law_data\/[^/]+)$/;
+const LAW_ID_PATTERN = /^\d{3}[A-Z][0-9A-Z]*$/i;
+const LAW_NUM_PATTERN = /^(?:明治|大正|昭和|平成|令和)[元〇一二三四五六七八九十百千0-9]+年|第[〇一二三四五六七八九十百千0-9]+号$/;
+const ASOF_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
-let lawListCache = null;
-let lawListFetchedAt = null;
+const responseCache = new Map();
+const pendingRequests = new Map();
+let requestChain = Promise.resolve();
+let lastRequestFinishedAt = 0;
+
+const asofProperty = {
+  type: "string",
+  pattern: "^\\d{4}-\\d{2}-\\d{2}$",
+  description:
+    "Optional point in time (YYYY-MM-DD). Uses the latest revision on or before that date; e-Gov accepts 2017-04-01 or later. Omit for the current version.",
+};
 
 const tools = [
   {
     name: "search_laws",
-    description: "Search current Japanese laws from e-Gov Law Search by keyword.",
+    description:
+      "Search current Japanese laws from e-Gov Law Search (Law API v2) by law title, abbreviation, law number, or law ID.",
     inputSchema: {
       type: "object",
       properties: {
         keyword: {
           type: "string",
-          description: "Keyword to search in law name, law number, or law ID.",
+          description: "Keyword to search in law title, abbreviation, law number, or law ID.",
         },
         category: {
           type: "string",
@@ -34,6 +64,7 @@ const tools = [
           maximum: 50,
           description: "Maximum number of results. Defaults to 10.",
         },
+        asof: asofProperty,
       },
       required: ["keyword"],
       additionalProperties: false,
@@ -41,13 +72,14 @@ const tools = [
   },
   {
     name: "get_article",
-    description: "Retrieve a specific article from e-Gov Law Search by law ID or law number.",
+    description: "Retrieve a specific article from e-Gov Law Search (Law API v2) by law ID or law number.",
     inputSchema: {
       type: "object",
       properties: {
         lawId: {
           type: "string",
-          description: "e-Gov law ID, for example 503AC0000000035.",
+          description:
+            "e-Gov law ID, for example 322AC0000000049. A law revision ID such as 322AC0000000049_20260717_508AC0000000060 pins that exact version (asof is then ignored).",
         },
         lawNum: {
           type: "string",
@@ -55,12 +87,13 @@ const tools = [
         },
         article: {
           type: "string",
-          description: "Article number, for example 2.",
+          description: "Article number in the main provision, for example 32, 32_2, 32の2, or 第三十二条の二.",
         },
         paragraph: {
           type: "string",
-          description: "Optional paragraph number.",
+          description: "Optional paragraph number, for example 2 or 第二項.",
         },
+        asof: asofProperty,
       },
       required: ["article"],
       additionalProperties: false,
@@ -68,13 +101,13 @@ const tools = [
   },
   {
     name: "get_law",
-    description: "Retrieve law metadata and a plain text preview from e-Gov Law Search.",
+    description: "Retrieve law metadata and a plain text preview from e-Gov Law Search (Law API v2).",
     inputSchema: {
       type: "object",
       properties: {
         lawId: {
           type: "string",
-          description: "e-Gov law ID. Either lawId or lawNum is required.",
+          description: "e-Gov law ID or law revision ID. Either lawId or lawNum is required.",
         },
         lawNum: {
           type: "string",
@@ -86,13 +119,15 @@ const tools = [
           maximum: 20000,
           description: "Maximum preview length. Defaults to 5000.",
         },
+        asof: asofProperty,
       },
       additionalProperties: false,
     },
   },
   {
     name: "find_related_laws",
-    description: "Find laws related to a base law name, including enforcement orders and regulations.",
+    description:
+      "Find laws related to a base law name or abbreviation, including enforcement orders and regulations.",
     inputSchema: {
       type: "object",
       properties: {
@@ -106,6 +141,7 @@ const tools = [
           maximum: 50,
           description: "Maximum number of results. Defaults to 10.",
         },
+        asof: asofProperty,
       },
       required: ["lawName"],
       additionalProperties: false,
@@ -142,33 +178,101 @@ function clampNumber(value, fallback, min, max) {
   return Math.max(min, Math.min(max, Math.trunc(parsed)));
 }
 
-function categoryToApiValue(category) {
+function optionalAsof(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const asof = typeof value === "string" ? value.trim() : "";
+  const date = new Date(`${asof}T00:00:00Z`);
+  if (!ASOF_PATTERN.test(asof) || Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== asof) {
+    throw new Error("asof must be a calendar date in YYYY-MM-DD format");
+  }
+  return asof;
+}
+
+function categoryToLawType(category) {
   switch (category) {
     case "acts":
-      return "2";
+      return "Constitution,Act";
     case "orders":
-      return "3";
+      return "CabinetOrder,ImperialOrder";
     case "rules":
-      return "4";
+      return "MinisterialOrdinance,Rule";
     case "all":
     case undefined:
     case null:
-      return "1";
+      return null;
     default:
       throw new Error("category must be one of all, acts, orders, rules");
   }
 }
 
-async function fetchText(path) {
-  if (!path.startsWith("/api/1/") || path.includes("..") || path.includes("//")) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Runs e-Gov requests one at a time, each starting no sooner than
+// REQUEST_INTERVAL_MS after the previous one finished (whether it succeeded or failed).
+function withPacing(task) {
+  const run = requestChain.then(async () => {
+    for (;;) {
+      const wait = lastRequestFinishedAt + REQUEST_INTERVAL_MS - Date.now();
+      if (wait <= 0) break;
+      await sleep(wait);
+    }
+    try {
+      return await task();
+    } finally {
+      lastRequestFinishedAt = Date.now();
+    }
+  });
+  requestChain = run.catch(() => {});
+  return run;
+}
+
+function apiUrl(path, params = {}) {
+  if (path.includes("..") || path.includes("//") || !ALLOWED_API_PATH.test(path)) {
     throw new Error("Internal error: refused non-e-Gov API path");
   }
 
   const url = new URL(path, EGOV_BASE_URL);
-  if (url.origin !== EGOV_BASE_URL) {
-    throw new Error("Internal error: resolved URL escaped e-Gov origin");
+  if (url.origin !== EGOV_BASE_URL || !ALLOWED_API_PATH.test(url.pathname)) {
+    throw new Error("Internal error: resolved URL escaped e-Gov Law API v2");
   }
 
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return url;
+}
+
+function cachedResponse(key) {
+  const cached = responseCache.get(key);
+  if (!cached || Date.now() - cached.cachedAt >= CACHE_TTL_MS) return null;
+  return { data: cached.data, retrievedAt: cached.retrievedAt };
+}
+
+function rememberResponse(key, data, retrievedAt) {
+  responseCache.delete(key);
+  responseCache.set(key, { data, retrievedAt, cachedAt: Date.now() });
+  if (responseCache.size > CACHE_MAX_ENTRIES) {
+    responseCache.delete(responseCache.keys().next().value);
+  }
+}
+
+function apiErrorMessage(status, body) {
+  let detail = "";
+  try {
+    const parsed = JSON.parse(body);
+    const parts = [parsed?.code, parsed?.message].filter((part) => typeof part === "string" && part);
+    if (parts.length) detail = ` (${parts.join(": ")})`;
+  } catch {
+    // Non-JSON error body: report the status only.
+  }
+  return `e-Gov API returned HTTP ${status}${detail}`;
+}
+
+async function requestJson(url, key) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -179,18 +283,38 @@ async function fetchText(path) {
       signal: controller.signal,
       headers: {
         "User-Agent": `${SERVER_NAME}/${SERVER_VERSION} (https://codeagent.jp/)`,
-        Accept: "application/xml,text/xml,*/*",
+        Accept: "application/json",
       },
     });
+    const body = await response.text();
+    const retrievedAt = new Date().toISOString();
 
     if (!response.ok) {
-      throw new Error(`e-Gov API returned HTTP ${response.status}`);
+      throw new Error(apiErrorMessage(response.status, body));
     }
 
-    return await response.text();
+    const data = JSON.parse(body);
+    if (body.length <= CACHE_MAX_BODY_CHARS) {
+      rememberResponse(key, data, retrievedAt);
+    }
+    return { data, retrievedAt };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// Identical requests share the cached answer, or the one already queued or in flight.
+async function fetchJson(url) {
+  const key = url.toString();
+  const cached = cachedResponse(key);
+  if (cached) return cached;
+
+  const pending = pendingRequests.get(key);
+  if (pending) return pending;
+
+  const request = withPacing(() => requestJson(url, key)).finally(() => pendingRequests.delete(key));
+  pendingRequests.set(key, request);
+  return request;
 }
 
 function decodeXml(text) {
@@ -217,43 +341,91 @@ function stripTags(xml) {
   ).trim();
 }
 
-function sourceInfo(path, lawId) {
-  const lawUrl = lawId ? `${EGOV_BASE_URL}/law/${encodeURIComponent(lawId)}` : `${EGOV_BASE_URL}${path}`;
+function lawDocumentUrl(lawId) {
+  return `${EGOV_BASE_URL}/law/${encodeURIComponent(lawId)}`;
+}
+
+function splitAbbreviations(abbrev) {
+  return typeof abbrev === "string"
+    ? abbrev
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean)
+    : [];
+}
+
+function lawSummary(item) {
+  const info = item?.law_info ?? {};
+  const revision = item?.revision_info ?? {};
   return {
-    name: "e-Gov法令検索",
-    url: lawUrl,
-    apiUrl: `${EGOV_BASE_URL}${path}`,
-    attribution: "出典: e-Gov法令検索（https://laws.e-gov.go.jp/）",
-    retrievedAt: new Date().toISOString(),
+    lawId: info.law_id ?? "",
+    lawName: revision.law_title ?? "",
+    lawNo: info.law_num ?? "",
+    promulgationDate: info.promulgation_date ?? "",
+    lawType: info.law_type ?? "",
+    abbreviations: splitAbbreviations(revision.abbrev),
+    lawRevisionId: revision.law_revision_id ?? "",
+    amendmentEnforcementDate: revision.amendment_enforcement_date ?? null,
+    currentRevisionStatus: revision.current_revision_status ?? "",
   };
 }
 
-function parseLawList(xml) {
-  const results = [];
-  const pattern = /<LawNameListInfo>([\s\S]*?)<\/LawNameListInfo>/gi;
-  for (const match of xml.matchAll(pattern)) {
-    const block = match[1];
-    results.push({
-      lawId: tagText(block, "LawId"),
-      lawName: tagText(block, "LawName"),
-      lawNo: tagText(block, "LawNo"),
-      promulgationDate: tagText(block, "PromulgationDate"),
-    });
-  }
-  return results.filter((law) => law.lawId && law.lawName);
+function listSource(url, retrievedAt, asof) {
+  return {
+    name: "e-Gov法令検索",
+    api: EGOV_API_NAME,
+    apiUrl: url.toString(),
+    asof,
+    attribution: ATTRIBUTION,
+    retrievedAt,
+  };
 }
 
-async function getLawList(category = "all") {
-  const apiCategory = categoryToApiValue(category);
-  if (lawListCache?.[apiCategory]) {
-    return lawListCache[apiCategory];
-  }
+function lawSource(url, retrievedAt, lawId, revision, asof) {
+  return {
+    name: "e-Gov法令検索",
+    api: EGOV_API_NAME,
+    url: lawId ? lawDocumentUrl(lawId) : url.toString(),
+    apiUrl: url.toString(),
+    lawId,
+    lawRevisionId: revision.law_revision_id ?? "",
+    amendmentEnforcementDate: revision.amendment_enforcement_date ?? null,
+    asof,
+    attribution: ATTRIBUTION,
+    processing: PROCESSING_NOTE,
+    retrievedAt,
+  };
+}
 
-  const xml = await fetchText(`/api/1/lawlists/${apiCategory}`);
-  const laws = parseLawList(xml);
-  lawListCache = { ...(lawListCache ?? {}), [apiCategory]: laws };
-  lawListFetchedAt = new Date().toISOString();
-  return laws;
+function resultSource() {
+  return {
+    name: "e-Gov法令検索",
+    attribution: ATTRIBUTION,
+  };
+}
+
+async function listLaws(filters, asof) {
+  const url = apiUrl(`${EGOV_API_PREFIX}/laws`, {
+    ...filters,
+    asof,
+    repeal_status: "None",
+    omit_current_revision_info: "true",
+    limit: SEARCH_SCAN_LIMIT,
+    response_format: "json",
+  });
+  const { data, retrievedAt } = await fetchJson(url);
+  const laws = (Array.isArray(data?.laws) ? data.laws : []).map(lawSummary).filter((law) => law.lawId && law.lawName);
+  const totalCount = Number.isFinite(data?.total_count) ? data.total_count : laws.length;
+  return { laws, totalCount, source: listSource(url, retrievedAt, asof) };
+}
+
+function searchFilter(keyword) {
+  if (LAW_ID_PATTERN.test(keyword)) return { law_id: keyword.toUpperCase() };
+  if (LAW_NUM_PATTERN.test(keyword)) return { law_num: keyword };
+  // e-Gov matches law_title as one substring, so send the longest token and
+  // check the remaining tokens locally in scoreLaw.
+  const longest = keyword.split(/\s+/).reduce((a, b) => (b.length > a.length ? b : a), "");
+  return { law_title: longest };
 }
 
 function scoreLaw(law, keyword) {
@@ -261,29 +433,35 @@ function scoreLaw(law, keyword) {
   const name = law.lawName.toLowerCase();
   const no = law.lawNo.toLowerCase();
   const id = law.lawId.toLowerCase();
+  const abbreviations = law.abbreviations.map((value) => value.toLowerCase());
 
   if (name === normalizedKeyword || no === normalizedKeyword || id === normalizedKeyword) return 100;
+  if (abbreviations.includes(normalizedKeyword)) return 95;
   if (name.startsWith(normalizedKeyword)) return 90;
   if (name.includes(normalizedKeyword)) return 80;
+  if (abbreviations.some((value) => value.includes(normalizedKeyword))) return 75;
   if (no.includes(normalizedKeyword) || id.includes(normalizedKeyword)) return 70;
 
   const tokens = normalizedKeyword.split(/\s+/).filter(Boolean);
-  if (tokens.length > 1 && tokens.every((token) => name.includes(token) || no.includes(token))) {
+  if (
+    tokens.length > 1 &&
+    tokens.every(
+      (token) => name.includes(token) || no.includes(token) || abbreviations.some((value) => value.includes(token)),
+    )
+  ) {
     return 60;
   }
 
   return 0;
 }
 
-function lawDocumentUrl(lawId) {
-  return `${EGOV_BASE_URL}/law/${encodeURIComponent(lawId)}`;
-}
-
 async function searchLaws(args) {
   const keyword = assertString(args?.keyword, "keyword");
   const limit = clampNumber(args?.limit, 10, 1, 50);
   const category = args?.category ?? "all";
-  const laws = await getLawList(category);
+  const lawType = categoryToLawType(category);
+  const asof = optionalAsof(args?.asof);
+  const { laws, totalCount, source } = await listLaws({ ...searchFilter(keyword), law_type: lawType }, asof);
 
   const results = laws
     .map((law) => ({ ...law, score: scoreLaw(law, keyword) }))
@@ -293,22 +471,23 @@ async function searchLaws(args) {
     .map((law) => ({
       ...law,
       url: lawDocumentUrl(law.lawId),
-      source: {
-        name: "e-Gov法令検索",
-        attribution: "出典: e-Gov法令検索（https://laws.e-gov.go.jp/）",
-      },
+      source: resultSource(),
     }));
 
   return {
     keyword,
     category,
+    asof,
     count: results.length,
-    cacheFetchedAt: lawListFetchedAt,
+    matchedCount: totalCount,
+    truncated: totalCount > laws.length,
+    cacheFetchedAt: source.retrievedAt,
+    source,
     results,
   };
 }
 
-function lawIdentifierPath(args) {
+function lawIdentifier(args) {
   const lawId = typeof args?.lawId === "string" ? args.lawId.trim() : "";
   const lawNum = typeof args?.lawNum === "string" ? args.lawNum.trim() : "";
   if (lawId) return { key: "lawId", value: lawId };
@@ -316,62 +495,146 @@ function lawIdentifierPath(args) {
   throw new Error("Either lawId or lawNum is required");
 }
 
-async function getArticle(args) {
-  const identifier = lawIdentifierPath(args);
-  const article = assertString(args?.article, "article");
-  const params = [`${identifier.key}=${encodeURIComponent(identifier.value)}`, `article=${encodeURIComponent(article)}`];
+const KANJI_DIGITS = { 〇: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+const KANJI_UNITS = { 十: 10, 百: 100, 千: 1000 };
+const NUMBER_CHARS = "0-9〇一二三四五六七八九十百千";
 
-  if (args?.paragraph !== undefined && args?.paragraph !== null && String(args.paragraph).trim() !== "") {
-    params.push(`paragraph=${encodeURIComponent(String(args.paragraph).trim())}`);
+function parseNumber(text) {
+  if (/^[0-9]+$/.test(text)) return Number(text);
+  let total = 0;
+  let digits = null;
+  for (const char of text) {
+    if (Object.hasOwn(KANJI_DIGITS, char)) {
+      digits = (digits ?? 0) * 10 + KANJI_DIGITS[char];
+    } else if (Object.hasOwn(KANJI_UNITS, char)) {
+      total += (digits ?? 1) * KANJI_UNITS[char];
+      digits = null;
+    } else {
+      return null;
+    }
+  }
+  return total + (digits ?? 0);
+}
+
+// 32, 32_2, 32-2, 32の2, 第32条の2, 第三十二条の二 -> "32" / "32_2" (the Num used in elm)
+function articleNumber(value) {
+  const normalized = String(value).normalize("NFKC").replace(/\s+/g, "");
+  const match = new RegExp(`^第?([${NUMBER_CHARS}]+)条?((?:[の_-][${NUMBER_CHARS}]+)*)$`).exec(normalized);
+  if (!match) return null;
+  const parts = [match[1], ...match[2].split(/[の_-]/).filter(Boolean)].map(parseNumber);
+  return parts.every((part) => Number.isInteger(part) && part > 0) ? parts.join("_") : null;
+}
+
+function paragraphNumber(value) {
+  const normalized = String(value).normalize("NFKC").replace(/\s+/g, "");
+  const match = new RegExp(`^第?([${NUMBER_CHARS}]+)項?$`).exec(normalized);
+  const parsed = match ? parseNumber(match[1]) : null;
+  return Number.isInteger(parsed) && parsed > 0 ? String(parsed) : null;
+}
+
+async function fetchLawData(identifier, { asof, elm }) {
+  const url = apiUrl(`${EGOV_API_PREFIX}/law_data/${encodeURIComponent(identifier.value)}`, {
+    elm,
+    asof,
+    response_format: "json",
+    // The JSON form of the law body is a trial format; ask for law XML instead.
+    // e-Gov returns it Base64-encoded because it differs from response_format.
+    law_full_text_format: "xml",
+  });
+  const { data, retrievedAt } = await fetchJson(url);
+  const xml =
+    typeof data?.law_full_text === "string" ? Buffer.from(data.law_full_text, "base64").toString("utf8") : "";
+  return { info: data?.law_info ?? {}, revision: data?.revision_info ?? {}, xml, url, retrievedAt };
+}
+
+async function getArticle(args) {
+  const identifier = lawIdentifier(args);
+  const article = assertString(args?.article, "article");
+  const articleNum = articleNumber(article);
+  if (!articleNum) {
+    throw new Error("article must be an article number such as 32, 32_2, 32の2, or 第三十二条の二");
   }
 
-  const path = `/api/1/articles;${params.join(";")}`;
-  const xml = await fetchText(path);
-  const lawId = tagText(xml, "LawId") || (identifier.key === "lawId" ? identifier.value : "");
-  const lawNum = tagText(xml, "LawNum") || (identifier.key === "lawNum" ? identifier.value : "");
-  const returnedArticle = article;
-  const paragraph = args?.paragraph ? String(args.paragraph).trim() : "";
-  const articleXml = [...xml.matchAll(/<Article\b[^>]*>[\s\S]*?<\/Article>/gi)]
-    .map((match) => match[0])
-    .sort((a, b) => b.length - a.length)[0] ?? "";
-  const text = stripTags(articleXml || tagText(xml, "ApplData"));
+  const paragraph =
+    args?.paragraph !== undefined && args?.paragraph !== null && String(args.paragraph).trim() !== ""
+      ? String(args.paragraph).trim()
+      : "";
+  let elm = `MainProvision-Article_${articleNum}`;
+  if (paragraph) {
+    const paragraphNum = paragraphNumber(paragraph);
+    if (!paragraphNum) {
+      throw new Error("paragraph must be a paragraph number such as 2 or 第二項");
+    }
+    elm += `-Paragraph_${paragraphNum}`;
+  }
+
+  const asof = optionalAsof(args?.asof);
+  const law = await fetchLawData(identifier, { asof, elm });
+  const lawId = law.info.law_id || (identifier.key === "lawId" ? identifier.value : "");
+  const lawNum = law.info.law_num || (identifier.key === "lawNum" ? identifier.value : "");
 
   return {
     lawId,
     lawNum,
-    article: returnedArticle,
+    lawTitle: law.revision.law_title ?? "",
+    lawRevisionId: law.revision.law_revision_id ?? "",
+    article,
     paragraph,
-    text,
-    source: sourceInfo(path, lawId),
+    elm,
+    articleCaption: tagText(law.xml, "ArticleCaption"),
+    articleTitle: tagText(law.xml, "ArticleTitle"),
+    asof,
+    text: stripTags(law.xml),
+    source: lawSource(law.url, law.retrievedAt, lawId, law.revision, asof),
     note: "This tool returns source text for reference only and does not provide legal advice.",
   };
 }
 
 async function getLaw(args) {
-  const identifier = lawIdentifierPath(args);
+  const identifier = lawIdentifier(args);
   const previewChars = clampNumber(args?.previewChars, 5000, 500, 20000);
-  const path = `/api/1/lawdata/${encodeURIComponent(identifier.value)}`;
-  const xml = await fetchText(path);
-  const lawId = tagText(xml, "LawId") || (identifier.key === "lawId" ? identifier.value : "");
-  const lawNum = tagText(xml, "LawNum") || (identifier.key === "lawNum" ? identifier.value : "");
-  const lawFullTextXml = /<LawFullText(?:\s[^>]*)?>[\s\S]*?<\/LawFullText>/i.exec(xml)?.[0] ?? "";
-  const plainText = stripTags(lawFullTextXml);
+  const asof = optionalAsof(args?.asof);
+  const law = await fetchLawData(identifier, { asof });
+  const lawId = law.info.law_id || (identifier.key === "lawId" ? identifier.value : "");
+  const lawNum = law.info.law_num || (identifier.key === "lawNum" ? identifier.value : "");
+  const plainText = stripTags(law.xml);
 
   return {
     lawId,
     lawNum,
+    lawTitle: law.revision.law_title ?? "",
+    abbreviations: splitAbbreviations(law.revision.abbrev),
+    lawType: law.info.law_type ?? "",
+    promulgationDate: law.info.promulgation_date ?? "",
+    lawRevisionId: law.revision.law_revision_id ?? "",
+    amendmentEnforcementDate: law.revision.amendment_enforcement_date ?? null,
+    currentRevisionStatus: law.revision.current_revision_status ?? "",
+    asof,
     preview: plainText.slice(0, previewChars),
     previewChars,
     truncated: plainText.length > previewChars,
-    source: sourceInfo(path, lawId),
+    source: lawSource(law.url, law.retrievedAt, lawId, law.revision, asof),
     note: "Use get_article for article-level retrieval and official e-Gov URLs for final verification.",
   };
+}
+
+function lawNameStem(lawName) {
+  return lawName.replace(/法律$/, "").replace(/法$/, "");
+}
+
+// One laws?law_title= query that covers the base law, its 施行令 / 施行規則, and
+// the parent law when lawName itself is an enforcement order or regulation.
+function relatedLawsQuery(lawName) {
+  const stem = lawNameStem(lawName.replace(/(?:施行令|施行規則)$/, ""));
+  return stem.length >= 2 ? stem : lawName;
 }
 
 async function findRelatedLaws(args) {
   const lawName = assertString(args?.lawName, "lawName");
   const limit = clampNumber(args?.limit, 10, 1, 50);
-  const laws = await getLawList("all");
+  const asof = optionalAsof(args?.asof);
+  const { laws, totalCount, source } = await listLaws({ law_title: relatedLawsQuery(lawName) }, asof);
+  const stem = lawNameStem(lawName);
   const candidates = [
     lawName,
     lawName.endsWith("法律") || lawName.endsWith("法") ? `${lawName}施行令` : null,
@@ -382,10 +645,14 @@ async function findRelatedLaws(args) {
 
   const results = laws
     .map((law) => {
-      const exact = candidates.some((candidate) => law.lawName === candidate);
-      const partial = candidates.some((candidate) => law.lawName.includes(candidate) || candidate.includes(law.lawName));
-      const enforcement = law.lawName.includes(lawName.replace(/法律$/, "").replace(/法$/, "")) &&
-        (law.lawName.includes("施行令") || law.lawName.includes("施行規則"));
+      const names = [law.lawName, ...law.abbreviations];
+      const exact = names.some((name) => candidates.includes(name));
+      const partial = names.some((name) =>
+        candidates.some((candidate) => name.includes(candidate) || candidate.includes(name)),
+      );
+      const enforcement = names.some(
+        (name) => name.includes(stem) && (name.includes("施行令") || name.includes("施行規則")),
+      );
       return {
         ...law,
         relationScore: exact ? 100 : partial ? 80 : enforcement ? 60 : 0,
@@ -397,15 +664,16 @@ async function findRelatedLaws(args) {
     .map((law) => ({
       ...law,
       url: lawDocumentUrl(law.lawId),
-      source: {
-        name: "e-Gov法令検索",
-        attribution: "出典: e-Gov法令検索（https://laws.e-gov.go.jp/）",
-      },
+      source: resultSource(),
     }));
 
   return {
     lawName,
+    asof,
     count: results.length,
+    matchedCount: totalCount,
+    truncated: totalCount > laws.length,
+    source,
     results,
   };
 }
