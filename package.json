@@ -1,11 +1,14 @@
 {
   "name": "@codeagentjp/egov-law-mcp",
   "mcpName": "io.github.SHAYOUWORLD/egov-law-mcp",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Local stdio MCP server for searching Japanese laws and retrieving article text from e-Gov Law Search. Includes related-law lookup (enforcement orders/regulations) inspired by Gennai Lawsy.",
   "type": "module",
   "bin": {
     "egov-law-mcp": "./bin/egov-law-mcp.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
   },
   "files": [
     "bin",
