@@ -4,43 +4,141 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to publish or resume (e.g. v0.2.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: publish-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   publish:
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      # npm Trusted Publishing requires Node >=22.14.0 and npm >=11.5.1.
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-      - name: Verify version matches tag
+      - name: Verify release identity before either registry is changed
         run: |
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "Tag $TAG_VERSION does not match package.json version $PKG_VERSION"
-            exit 1
-          fi
-      - name: Publish
-        run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const pkg = JSON.parse(readFileSync('package.json'));
+          const server = JSON.parse(readFileSync('server.json'));
+          assert.equal(process.env.RELEASE_TAG, `v${pkg.version}`);
+          assert.equal(server.version, pkg.version);
+          assert.equal(server.name, pkg.mcpName);
+          assert.equal(server.packages.length, 1);
+          assert.equal(server.packages[0].registryType, 'npm');
+          assert.equal(server.packages[0].identifier, pkg.name);
+          assert.equal(server.packages[0].version, pkg.version);
+          const git = (...args) => execFileSync('git', args, {encoding: 'utf8'}).trim();
+          assert.equal(git('rev-parse', `refs/tags/${process.env.RELEASE_TAG}^{commit}`), git('rev-parse', 'HEAD'));
+          git('merge-base', '--is-ancestor', 'HEAD', 'origin/main');
+          const [major, minor, patch] = execFileSync('npm', ['--version'], {encoding: 'utf8'}).trim().split('.').map(Number);
+          assert.ok(major > 11 || major === 11 && (minor > 5 || minor === 5 && patch >= 1), 'npm >=11.5.1 required');
+          NODE
+      - name: Test
+        run: npm test
+      - name: Smoke test MCP entry point
+        run: node scripts/smoke-mcp.mjs
+      - name: Pack the exact artifact
+        run: npm pack --json > "$RUNNER_TEMP/npm-pack.json"
+      - name: Check npm version for safe retry
+        id: npm
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync('package.json'));
+          const [pack] = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/npm-pack.json`));
+          const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(pkg.name)}/${pkg.version}`, {signal: AbortSignal.timeout(30000)});
+          if (response.status === 404) {
+            appendFileSync(process.env.GITHUB_OUTPUT, 'exists=false\n');
+          } else {
+            assert.ok(response.ok, `npm registry returned ${response.status}`);
+            const published = await response.json();
+            assert.equal(published.dist.integrity, pack.integrity, 'Existing npm artifact differs; never overwrite or continue');
+            appendFileSync(process.env.GITHUB_OUTPUT, 'exists=true\n');
+          }
+          NODE
+      # Register SHAYOUWORLD / egov-law-mcp / publish.yml on npm first.
+      # OIDC provides authentication and provenance; no NPM_TOKEN fallback.
+      - name: Publish npm artifact
+        if: steps.npm.outputs.exists != 'true'
+        run: |
+          ARTIFACT=$(node -p "JSON.parse(require('fs').readFileSync(process.env.RUNNER_TEMP + '/npm-pack.json'))[0].filename")
+          npm publish "$ARTIFACT" --access public
+      - name: Verify public npm installation and MCP startup
+        run: node scripts/smoke-mcp.mjs --registry
+      - name: Check MCP Registry for safe retry
+        id: mcp
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const expected = JSON.parse(readFileSync('server.json'));
+          const response = await fetch(`https://registry.modelcontextprotocol.io/v0.1/servers/${encodeURIComponent(expected.name)}/versions/${expected.version}`, {signal: AbortSignal.timeout(30000)});
+          if (response.status === 404) {
+            appendFileSync(process.env.GITHUB_OUTPUT, 'exists=false\n');
+          } else {
+            assert.ok(response.ok, `MCP registry returned ${response.status}`);
+            const published = await response.json();
+            assert.equal(published.server.name, expected.name);
+            assert.equal(published.server.version, expected.version);
+            assert.deepEqual(published.server.packages, expected.packages);
+            assert.equal(published._meta['io.modelcontextprotocol.registry/official'].status, 'active');
+            appendFileSync(process.env.GITHUB_OUTPUT, 'exists=true\n');
+          }
+          NODE
       - name: Install mcp-publisher
+        if: steps.mcp.outputs.exists != 'true'
         run: |
-          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
-      - name: Verify server.json version matches tag
-        run: |
-          SERVER_VERSION=$(node -p "require('./server.json').version")
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          if [ "$SERVER_VERSION" != "$TAG_VERSION" ]; then
-            echo "Tag $TAG_VERSION does not match server.json version $SERVER_VERSION"
-            exit 1
-          fi
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.6/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
       - name: Authenticate to MCP Registry
+        if: steps.mcp.outputs.exists != 'true'
         run: ./mcp-publisher login github-oidc
       - name: Publish to MCP Registry
+        if: steps.mcp.outputs.exists != 'true'
         run: ./mcp-publisher publish
+      - name: Verify latest versions in both public registries
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync('package.json'));
+          const expected = JSON.parse(readFileSync('server.json'));
+          for (const [url, check] of [
+            [`https://registry.npmjs.org/${encodeURIComponent(pkg.name)}`, r => {
+              assert.equal(r['dist-tags'].latest, pkg.version);
+              const [pack] = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/npm-pack.json`));
+              assert.equal(r.versions[pkg.version].dist.integrity, pack.integrity);
+            }],
+            [`https://registry.modelcontextprotocol.io/v0.1/servers/${encodeURIComponent(expected.name)}/versions/latest`, r => {
+              assert.equal(r.server.version, pkg.version);
+              assert.deepEqual(r.server.packages, expected.packages);
+              assert.equal(r._meta['io.modelcontextprotocol.registry/official'].status, 'active');
+            }],
+          ]) {
+            const response = await fetch(url, {signal: AbortSignal.timeout(30000)});
+            assert.ok(response.ok, `${url}: ${response.status}`);
+            check(await response.json());
+          }
+          NODE
